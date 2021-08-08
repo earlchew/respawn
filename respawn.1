@@ -65,7 +65,7 @@ backoff if the restarted process initialises but fails within
 if the process runs for longer than 60 seconds.
 .Sh OPTIONS
 .Bl -tag -width Ds
-.It Fl d
+.It Fl d Fl \-debug
 Print debugging information.
 .It Fl f Fl \-forever
 Repeatedly restart the process, without considering exit
@@ -110,9 +110,10 @@ Restart an
 session on connection failure:
 .Pp
 .Dl $ SSHOPTS='-o ConnectTimeout=10 -o ServerAliveInterval=10'
-.Dl $ respawn -- ssh $SSHOPTS phobos
+.Dl $ respawn -- timebound 3 -- ssh $SSHOPTS phobos
 .Sh AUTHOR
 .Nm
 was written by Earl Chew.
 .Sh SEE ALSO
-.Xr autossh 1
+.Xr autossh 1 ,
+.Xr timebound 1
