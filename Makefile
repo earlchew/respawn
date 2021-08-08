@@ -7,6 +7,11 @@ man:	respawn.man
 .PHONY:	lib
 lib:	library.a
 
+.PHONY:	clean
+clean:
+	$(RM) *.o
+	$(RM) library.a
+
 CFLAGS = -Wall -Werror -D_GNU_SOURCE -Ilib/
 respawn:	respawn.c library.a
 
