@@ -1,8 +1,8 @@
 .PHONY:	all
-all:	respawn
+all:	respawn timebound
 
 .PHONY:	man
-man:	respawn.man
+man:	respawn.man timebound.man
 
 .PHONY:	lib
 lib:	library.a
@@ -14,6 +14,7 @@ clean:
 
 CFLAGS = -Wall -Werror -D_GNU_SOURCE -Ilib/
 respawn:	respawn.c library.a
+timebound:	timebound.c library.a
 
 LIBOBJS = $(patsubst %.c,%.o,$(wildcard lib/*.c))
 ARFLAGS = crvs
