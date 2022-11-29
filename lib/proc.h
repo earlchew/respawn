@@ -20,4 +20,8 @@
 
 pid_t proc_execute(char **aCmd);
 
+int proc_monitor_create(pid_t aParentPid);
+int proc_monitor_wait(int aMonitorFd);
+int proc_monitor_close(int aMonitorFd);
+
 #endif

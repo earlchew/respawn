@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <sys/event.h>
 #include <sys/wait.h>
 
 /******************************************************************************/
@@ -123,6 +124,84 @@ Finally:
     });
 
     return rc ? -1 : childPid;
+}
+
+/******************************************************************************/
+int proc_monitor_create(pid_t aParentPid)
+{
+    int rc = -1;
+
+    int monitorFd = kqueue();
+    if (-1 == monitorFd)
+        goto Finally;
+
+    struct kevent kevs[2];
+
+    struct kevent *kevp = kevs;
+    int nkevs = 0;
+
+    EV_SET(
+        kevp++, SIGCHLD,
+        EVFILT_SIGNAL, EV_ADD | EV_ENABLE,
+        0, 0, 0);
+    ++nkevs;
+
+    if (aParentPid) {
+        EV_SET(
+            kevp++, aParentPid,
+            EVFILT_PROC,
+            (aParentPid ? EV_ADD : EV_DISABLE),
+            NOTE_EXIT | NOTE_EXITSTATUS, 0, 0);
+        ++nkevs;
+    }
+
+    if (-1 == kevent(monitorFd, kevs, nkevs, 0, 0, 0))
+        goto Finally;
+
+    rc = 0;
+
+Finally:
+    FINALLY({
+        if (rc) {
+            if (-1 != monitorFd)
+                close(monitorFd);
+        }
+    });
+
+    return rc ? rc : monitorFd;
+}
+
+/*----------------------------------------------------------------------------*/
+int proc_monitor_wait(int aMonitorFd)
+{
+    int rc = -1;
+
+    int ident = 0;
+
+    struct kevent kev;
+    int kevents = kevent(aMonitorFd, 0, 0, &kev, 1, 0);
+
+    if (-1 == kevents) {
+        if (EINTR != errno)
+            goto Finally;
+    } else {
+        if (kevents && EVFILT_PROC == kev.filter)
+            ident = kev.ident;
+    }
+
+    rc = 0;
+
+Finally:
+
+    return rc ? rc : ident;
+}
+
+/*----------------------------------------------------------------------------*/
+int proc_monitor_close(int aMonitorFd)
+{
+    close(aMonitorFd);
+
+    return 0;
 }
 
 /******************************************************************************/
