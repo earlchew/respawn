@@ -31,12 +31,14 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/event.h>
 #include <sys/wait.h>
 
 /******************************************************************************/
 static int optHelp;
 static int optContinue;
 static int optForever;
+static int optParented;
 
 static unsigned char optExit[256] = { 1 };
 
@@ -50,6 +52,7 @@ usage(void)
         "Options:\n"
         "  -d --debug      Emit debug information\n"
         "  -f --forever    Continually restart the monitored process\n"
+        "  -P --parented   Terminate if no longer parented\n"
         "  -Z --continue   Continue monitored process if it suspends\n"
         "  -x --exit N,..  Additional success exit codes [default: 0]\n"
         "  -x --exit none  No success exit codes [default: 0]\n"
@@ -68,12 +71,13 @@ parse_options(int argc, char **argv)
 {
     int rc = -1;
 
-    static char shortOpts[] = "+hdfZx:";
+    static char shortOpts[] = "+hdfPZx:";
 
     static struct option longOpts[] = {
         { "help",      no_argument,       0, 'h' },
         { "debug",     no_argument,       0, 'd' },
         { "forever",   no_argument,       0, 'f' },
+        { "parented",  no_argument,       0, 'P' },
         { "continue",  no_argument,       0, 'Z' },
         { "exit",      required_argument, 0, 'x' },
         { 0 },
@@ -99,6 +103,9 @@ parse_options(int argc, char **argv)
 
         case 'f':
             optForever = 1; break;
+
+        case 'P':
+            optParented = 1; break;
 
         case 'Z':
             optContinue = 1; break;
@@ -160,14 +167,61 @@ Finally:
 }
 
 /******************************************************************************/
+void
+terminate(void)
+{
+    signal(SIGTERM, SIG_IGN);
+    killpg(0, SIGTERM);
+    sleep(3);
+    killpg(0, SIGKILL);
+}
+
+/******************************************************************************/
 int
-spawn_command(char **aCmd)
+spawn_command(char **aCmd, pid_t aParentPid)
 {
     int rc = -1;
 
-    pid_t childPid = proc_execute(aCmd);
-    if (-1 == childPid)
+    int kq = kqueue();
+    if (-1 == kq) {
+        warn("Unable to create kqueue");
         goto Finally;
+    }
+
+    pid_t childPid = proc_execute(aCmd);
+    if (-1 == childPid) {
+        warn("Unable to spawn command %s", aCmd[0]);
+        goto Finally;
+    }
+
+    /* Use a kqueue to watch if the parent process exits, or the
+     * child process changes state.
+     */
+
+    struct kevent kevs[2];
+
+    struct kevent *kevp = kevs;
+    int nkevs = 0;
+
+    EV_SET(
+        kevp++, SIGCHLD,
+        EVFILT_SIGNAL, EV_ADD | EV_ENABLE,
+        0, 0, 0);
+    ++nkevs;
+
+    if (aParentPid) {
+        EV_SET(
+            kevp++, aParentPid,
+            EVFILT_PROC,
+            (aParentPid ? EV_ADD : EV_DISABLE),
+            NOTE_EXIT | NOTE_EXITSTATUS, 0, 0);
+        ++nkevs;
+    }
+
+    if (-1 == kevent(kq, kevs, nkevs, 0, 0, 0)) {
+        warn("Unable to configure kqueue events");
+        goto Finally;
+    }
 
     while (1) {
 
@@ -191,62 +245,95 @@ spawn_command(char **aCmd)
             sigSet >>= 1;
         }
 
+        struct kevent kev;
+        int kevents = kevent(kq, 0, 0, &kev, 1, 0);
+
+        if (-1 == kevents) {
+            if (EINTR != errno) {
+                warn("Unable to wait for kqueue events");
+                goto Finally;
+            }
+        }
+
+        DEBUG("Received kqueue events %d", kevents);
+
+        if (kevents && EVFILT_PROC == kev.filter) {
+
+            /* If the process must be parented, and the parent has exited,
+             * there is no parent waiting for exit status.
+             */
+
+            DEBUG("Parent process %d exit status %ld", aParentPid, kev.data);
+
+            terminate();
+            goto Finally;
+        }
+
         int childStatus;
 
-        pid_t pid = waitpid(childPid, &childStatus, WUNTRACED);
+        pid_t pid = waitpid(childPid, &childStatus, WNOHANG|WUNTRACED);
         if (-1 == pid) {
             if (EINTR == errno)
                 continue;
-            fatal("Unable to wait for child process %d", childPid);
+            warn("Unable to wait for child process %d", childPid);
+            goto Finally;
         }
 
-        if (WIFSTOPPED(childStatus)) {
-            int stopSig = WSTOPSIG(childStatus);
+        if (pid) {
 
-            DEBUG("Child process %d stopped signal %d", childPid, stopSig);
+            if (WIFSTOPPED(childStatus)) {
+                int stopSig = WSTOPSIG(childStatus);
 
-            /* http://curiousthing.org/sigttin-sigttou-deep-dive-linux */
+                DEBUG("Child process %d stopped signal %d", childPid, stopSig);
 
-            if (SIGSTOP == stopSig || SIGTSTP == stopSig) {
-                if (optContinue) {
-                    signalset_add(SIGCONT);
-                    stopSig = 0;
+                /* http://curiousthing.org/sigttin-sigttou-deep-dive-linux */
+
+                if (SIGSTOP == stopSig || SIGTSTP == stopSig) {
+                    if (optContinue) {
+                        signalset_add(SIGCONT);
+                        stopSig = 0;
+                    }
                 }
+
+                if (stopSig) {
+                    if (kill(getpid(), stopSig)) {
+                        warn("Unable to stop process after signal %d", stopSig);
+                    }
+                }
+
+                continue;
             }
 
-            if (stopSig) {
-                if (kill(getpid(), stopSig)) {
-                    warn("Unable to stop process after signal %d", stopSig);
-                }
+            if (WIFEXITED(childStatus)) {
+                int exitStatus = WEXITSTATUS(childStatus);
+
+                DEBUG("Child process %d exit status %d", childPid, exitStatus);
+                rc = 0x000 + exitStatus;
+            }
+            else if (WIFSIGNALED(childStatus)) {
+                int termSig = WTERMSIG(childStatus);
+
+                DEBUG("Child process %d termination signal %d", childPid, termSig);
+                rc = 0x100 + termSig;
             }
 
-            continue;
+            break;
         }
-
-        if (WIFEXITED(childStatus)) {
-            int exitStatus = WEXITSTATUS(childStatus);
-
-            DEBUG("Child process %d exit status %d", childPid, exitStatus);
-            rc = 0x000 + exitStatus;
-        }
-        else if (WIFSIGNALED(childStatus)) {
-            int termSig = WTERMSIG(childStatus);
-
-            DEBUG("Child process %d termination signal %d", childPid, termSig);
-            rc = 0x100 + termSig;
-        }
-
-        break;
     }
 
 Finally:
+
+    FINALLY({
+        if (-1 != kq)
+            close(kq);
+    });
 
     return rc;
 }
 
 /******************************************************************************/
 int
-respawn_command(char **aCmd)
+respawn_command(char **aCmd, pid_t aParentPid)
 {
     int rc = -1;
 
@@ -267,7 +354,7 @@ respawn_command(char **aCmd)
         DEBUG("Spawning count %u attempt %u", spawnCount, spawnAttempt);
 
         signal_catch();
-        exitCode = spawn_command(aCmd);
+        exitCode = spawn_command(aCmd, aParentPid);
         signal_release();
 
         uint64_t windowEndMillis = clk_monomillis();
@@ -364,7 +451,14 @@ main(int argc, char **argv)
     if (!cmd || !cmd[0])
         usage();
 
-    int cmdExit = respawn_command(cmd);
+    pid_t parentPid = 0;
+    if (optParented) {
+        parentPid = getppid();
+        if (1 >= parentPid)
+            goto Finally;
+    }
+
+    int cmdExit = respawn_command(cmd, parentPid);
 
     if (-1 == cmdExit)
         goto Finally;
