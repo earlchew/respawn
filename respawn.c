@@ -178,48 +178,13 @@ terminate(void)
 
 /******************************************************************************/
 int
-spawn_command(char **aCmd, pid_t aParentPid)
+spawn_command(char **aCmd, int aMonitorFd)
 {
     int rc = -1;
-
-    int kq = kqueue();
-    if (-1 == kq) {
-        warn("Unable to create kqueue");
-        goto Finally;
-    }
 
     pid_t childPid = proc_execute(aCmd);
     if (-1 == childPid) {
         warn("Unable to spawn command %s", aCmd[0]);
-        goto Finally;
-    }
-
-    /* Use a kqueue to watch if the parent process exits, or the
-     * child process changes state.
-     */
-
-    struct kevent kevs[2];
-
-    struct kevent *kevp = kevs;
-    int nkevs = 0;
-
-    EV_SET(
-        kevp++, SIGCHLD,
-        EVFILT_SIGNAL, EV_ADD | EV_ENABLE,
-        0, 0, 0);
-    ++nkevs;
-
-    if (aParentPid) {
-        EV_SET(
-            kevp++, aParentPid,
-            EVFILT_PROC,
-            (aParentPid ? EV_ADD : EV_DISABLE),
-            NOTE_EXIT | NOTE_EXITSTATUS, 0, 0);
-        ++nkevs;
-    }
-
-    if (-1 == kevent(kq, kevs, nkevs, 0, 0, 0)) {
-        warn("Unable to configure kqueue events");
         goto Finally;
     }
 
@@ -245,25 +210,19 @@ spawn_command(char **aCmd, pid_t aParentPid)
             sigSet >>= 1;
         }
 
-        struct kevent kev;
-        int kevents = kevent(kq, 0, 0, &kev, 1, 0);
-
-        if (-1 == kevents) {
-            if (EINTR != errno) {
-                warn("Unable to wait for kqueue events");
-                goto Finally;
-            }
+        int procEvent = proc_monitor_wait(aMonitorFd);
+        if (-1 == procEvent) {
+            warn("Unable to wait for process monitor");
+            goto Finally;
         }
 
-        DEBUG("Received kqueue events %d", kevents);
-
-        if (kevents && EVFILT_PROC == kev.filter) {
+        if (procEvent) {
 
             /* If the process must be parented, and the parent has exited,
              * there is no parent waiting for exit status.
              */
 
-            DEBUG("Parent process %d exit status %ld", aParentPid, kev.data);
+            DEBUG("Parent process %d exited", procEvent);
 
             terminate();
             goto Finally;
@@ -323,17 +282,12 @@ spawn_command(char **aCmd, pid_t aParentPid)
 
 Finally:
 
-    FINALLY({
-        if (-1 != kq)
-            close(kq);
-    });
-
     return rc;
 }
 
 /******************************************************************************/
 int
-respawn_command(char **aCmd, pid_t aParentPid)
+respawn_command(char **aCmd, int aMonitorFd)
 {
     int rc = -1;
 
@@ -354,7 +308,7 @@ respawn_command(char **aCmd, pid_t aParentPid)
         DEBUG("Spawning count %u attempt %u", spawnCount, spawnAttempt);
 
         signal_catch();
-        exitCode = spawn_command(aCmd, aParentPid);
+        exitCode = spawn_command(aCmd, aMonitorFd);
         signal_release();
 
         uint64_t windowEndMillis = clk_monomillis();
@@ -444,6 +398,7 @@ int
 main(int argc, char **argv)
 {
     int exitCode = 255;
+    int monitorFd = -1;
 
     srand(getpid());
 
@@ -458,7 +413,13 @@ main(int argc, char **argv)
             goto Finally;
     }
 
-    int cmdExit = respawn_command(cmd, parentPid);
+    monitorFd = proc_monitor_create(parentPid);
+    if (-1 == monitorFd) {
+        warn("Unable to create proc monitor");
+        goto Finally;
+    }
+
+    int cmdExit = respawn_command(cmd, monitorFd);
 
     if (-1 == cmdExit)
         goto Finally;
