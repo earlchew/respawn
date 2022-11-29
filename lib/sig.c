@@ -18,6 +18,9 @@
 
 #include "err.h"
 
+#include <signal.h>
+#include <unistd.h>
+
 /******************************************************************************/
 static volatile sig_atomic_t SignalSet_;
 
@@ -118,8 +121,6 @@ signal_catch(void)
      * and not being ignored. Processes inherit default and ignored
      * signal settings from their parent. */
 
-    (void) signalset_sample();
-
     for (unsigned ix = 0; ix < NUMBEROF(SigStrategy); ++ix) {
 
         struct sigaction action;
@@ -158,6 +159,21 @@ signal_release(void)
             if (sigaction(SigStrategy[ix].mSignal, &action, 0))
                 die("Unable to reset signal %s", SigStrategy[ix].mName);
         }
+    }
+
+    /* Because there is no explicit notion of time associated with signal
+     * delivery, it is better to deliver signals rather than lose them.
+     */
+
+    int selfPid = getpid();
+
+    sig_atomic_t sigSet = signalset_sample();
+
+    for (int signal = 0; sigSet; ++signal) {
+        if (sigSet & 1) {
+            kill(selfPid, signal);
+        }
+        sigSet >>= 1;
     }
 }
 
